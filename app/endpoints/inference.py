@@ -1,74 +1,67 @@
+
 import pickle
-import json
 import pandas as pd
 
+from typing import Optional
+from pydantic import BaseModel
+
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sklearn.model_selection import train_test_split
-
 from app.database.database import get_session
-from app.services.model import Prediction, InferenceInput, StressLevelDatasetClean
+from app.services.model import Prediction, InferenceInput
 from app import columns
 
 
 router = APIRouter()
 
 
+class PredictRequest(BaseModel):
+    anxiety_level: Optional[int] = 4
+    self_esteem: Optional[int] = 3
+    mental_health_history: Optional[int] = 1
+    depression: Optional[int] = 3
+    headache: Optional[int] = 4
+    blood_pressure: Optional[int] = 3
+    sleep_quality: Optional[int] = 1
+    breathing_problem: Optional[int] = 3
+    noise_level: Optional[int] = 4
+    living_conditions: Optional[int] = 2
+    safety: Optional[int] = 2
+    basic_needs: Optional[int] = 2
+    academic_performance: Optional[int] = 2
+    study_load: Optional[int] = 3
+    teacher_student_relationship: Optional[int] = 1
+    future_career_concerns: Optional[int] = 4
+    social_support: Optional[int] = 1
+    peer_pressure: Optional[int] = 4
+    extracurricular_activities: Optional[int] = 4
+    bullying: Optional[int] = 5
+
+
 @router.post("/predict")
 async def predict(
+    request: PredictRequest,
     session: AsyncSession = Depends(get_session)
 ):
 
-    # 1. Отримання вхідних даних із БД
-    result = await session.execute(
-        select(StressLevelDatasetClean).order_by(
-            StressLevelDatasetClean.ID
-        )
-    )
+    input_data = request.dict()
 
-    records = result.scalars().all()
+    input_df = pd.DataFrame([input_data])
 
-    input_df = pd.DataFrame([
-        {
-            column.name: getattr(record, column.name)
-            for column in StressLevelDatasetClean.__table__.columns
-        }
-        for record in records
-    ])
-
-    input_df = input_df.dropna(subset=["stress_level"])
-
-    # 2. Отримання відкладених 10% даних
-    _, input_df = train_test_split(
-        input_df,
-        train_size=0.9,
-        random_state=42
-    )
-
-    input_df = input_df.copy()
-
-    # Збереження початкових вхідних параметрів
-    input_data = json.loads(
-        input_df[
-            ["ID"] + columns.X_columns + ["stress_level"]
-        ].to_json(orient="records")
-    )
-
-    # 3. Завантаження моделі з диска
+   
     with open("models/finalized_model.sav", "rb") as file:
         model = pickle.load(file)
 
-    # 4. Завантаження параметрів попередньої обробки
+
     with open("models/param_dict.pickle", "rb") as file:
         param_dict = pickle.load(file)
 
-    # 5. Заповнення пропущених значень
+    
     for column, mean_value in param_dict["mean_impute_values"].items():
         input_df[column] = input_df[column].fillna(mean_value)
 
-    # Перевірка, чи всі ознаки мають значення
+    
     missing = [
         column for column in columns.X_columns
         if input_df[column].isna().any()
@@ -80,7 +73,7 @@ async def predict(
             detail=f"Missing values: {missing}"
         )
 
-    # 6. Масштабування ознак
+   
     for column, values in param_dict["scale_values"].items():
         min_value = values["min"]
         max_value = values["max"]
@@ -91,28 +84,50 @@ async def predict(
                 (max_value - min_value)
             ) * 4 + 1
 
-    # 7. Виконання передбачення
+  
     X_input = input_df[columns.X_columns]
+
+    X_input = input_df[columns.X_columns]
+
+    print("Дані перед predict:")
+    print(X_input.to_string())
+
     prediction = model.predict(X_input)
 
-    # 8. Збереження передбачення та вхідних параметрів
-    session.add_all([
+   
+    prediction = model.predict(X_input)
+
+    print("Вхідні дані:")
+    print(X_input)
+
+    print("Прогноз:")
+    print(prediction)
+
+    print("Класи, які знає модель:")
+    print(model.classes_)
+    
+    session.add(
         Prediction(
-            prediction=int(p),
+            prediction=int(prediction[0]),
             source="inference"
         )
-        for p in prediction
-    ] + [
+    )
+
+    print("Дані після обробки:")
+    print(X_input if "X_input" in locals() else input_df[columns.X_columns].to_string())
+
+    
+    session.add(
         InferenceInput(
-            input_data=row
+            input_data=input_data
         )
-        for row in input_data
-    ])
+    )
 
     await session.commit()
 
-    # 9. Повернення результату
+    
     return {
         "message": "Prediction completed successfully.",
-        "inference_records": len(prediction)
+        "input_data": input_data,
+        "predicted_stress_level": int(prediction[0])
     }
