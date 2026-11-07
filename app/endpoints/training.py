@@ -41,10 +41,10 @@ async def train_model(session: AsyncSession = Depends(get_session)):
         for record in records
     ])
 
-    # 2. Видалення рядків, у яких відсутня цільова змінна
+    
     df = df.dropna(subset=["stress_level"])
 
-    # 3. Розділення даних на train та new_input (90:10)
+    
     train_df, new_input_df = train_test_split(
         df,
         train_size=0.9,
@@ -54,30 +54,21 @@ async def train_model(session: AsyncSession = Depends(get_session)):
     train_df = train_df.copy()
     new_input_df = new_input_df.copy()
 
-    # 4. Заповнення пропущених значень середнім
-    mean_impute_columns = [
-        "anxiety_level",
-        "depression",
-        "stress_level"
-    ]
-
-    def impute_na(df, variable, value):
-        return df[variable].fillna(value)
+    mean_impute_columns = columns.X_columns
 
     mean_impute_values = {}
 
     for column in mean_impute_columns:
         mean_impute_values[column] = train_df[column].mean()
 
-        train_df[column] = impute_na(
-            train_df, column, mean_impute_values[column]
+        train_df[column] = train_df[column].fillna(
+            mean_impute_values[column]
         )
 
-        new_input_df[column] = impute_na(
-            new_input_df, column, mean_impute_values[column]
+        new_input_df[column] = new_input_df[column].fillna(
+            mean_impute_values[column]
         )
 
-    # 5. Масштабування ознак у діапазон від 1 до 5
     scale_columns = [
         "depression",
         "anxiety_level"#,
@@ -106,25 +97,25 @@ async def train_model(session: AsyncSession = Depends(get_session)):
                 (max_value - min_value)
             ) * 4 + 1
 
-    # 6. Відокремлення ознак X від цільової змінної y
+    
     X_train = train_df[columns.X_columns]
     y_train = train_df[columns.y_column[0]]
 
-    # 7. Створення та навчання моделі з найкращими гіперпараметрами
+    
     model = DecisionTreeClassifier(
         **model_best_hyperparameters.params
     )
 
     model.fit(X_train, y_train)
 
-    # 8. Створення папки для збереження моделі
+    # Створення папки для збереження моделі
     os.makedirs("models", exist_ok=True)
 
-    # 9. Збереження навченої моделі
+    # Збереження навченої моделі
     with open("models/finalized_model.sav", "wb") as file:
         pickle.dump(model, file)
 
-    # 10. Збереження параметрів попередньої обробки
+    # Збереження параметрів попередньої обробки
     param_dict = {
         "mean_impute_values": mean_impute_values,
         "scale_values": scale_values
@@ -133,10 +124,10 @@ async def train_model(session: AsyncSession = Depends(get_session)):
     with open("models/param_dict.pickle", "wb") as file:
         pickle.dump(param_dict, file)
 
-    # 11. Отримання передбачень на навчальних даних
+    # Отримання передбачень на навчальних даних
     y_pred = model.predict(X_train)
 
-    # 12. Запис передбачень у таблицю predictions
+    #Запис передбачень у таблицю predictions
     predictions = []
 
     for p in y_pred:
@@ -150,7 +141,7 @@ async def train_model(session: AsyncSession = Depends(get_session)):
 
     session.add_all(predictions)
 
-    # 13. Збереження змін у базі даних
+    # Збереження змін у базі даних
     await session.commit()
 
     return {
