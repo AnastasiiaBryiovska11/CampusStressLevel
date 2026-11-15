@@ -1,16 +1,24 @@
-
 import pickle
-import pandas as pd
-
+from datetime import datetime
 from typing import Optional
-from pydantic import BaseModel
 
+import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
+from sklearn.model_selection import train_test_split
+from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.database import get_session
-from app.services.model import Prediction, InferenceInput
+from app.services.model import Prediction, InferenceInput, StressLevelDatasetClean
 from app import columns
+
+
+# ====== ПЕРЕМИКАЧ ======
+# "holdout" -> прогноз на відкладених 10% датасету (запускати один раз)
+# "json"    -> прогноз по одному запиту з JSON (додає по одному рядку)
+MODE = "json"
+# =======================
 
 
 router = APIRouter()
@@ -39,95 +47,162 @@ class PredictRequest(BaseModel):
     bullying: Optional[int] = 5
 
 
-@router.post("/predict")
-async def predict(
-    request: PredictRequest,
-    session: AsyncSession = Depends(get_session)
-):
-
-    input_data = request.dict()
-
-    input_df = pd.DataFrame([input_data])
-
-   
-    with open("models/finalized_model.sav", "rb") as file:
-        model = pickle.load(file)
+def load_artifacts():
+    try:
+        with open("models/finalized_model.sav", "rb") as file:
+            model = pickle.load(file)
+        with open("models/param_dict.pickle", "rb") as file:
+            param_dict = pickle.load(file)
+    except FileNotFoundError:
+        raise HTTPException(status_code=400, detail="Спочатку виконай /train-model")
+    return model, param_dict
 
 
-    with open("models/param_dict.pickle", "rb") as file:
-        param_dict = pickle.load(file)
+def preprocess(df: pd.DataFrame, param_dict: dict) -> pd.DataFrame:
+    """Та сама обробка, що при навчанні."""
+    df = df.copy()
 
-    
     for column, mean_value in param_dict["mean_impute_values"].items():
-        input_df[column] = input_df[column].fillna(mean_value)
+        df[column] = df[column].fillna(mean_value)
 
-    
-    missing = [
-        column for column in columns.X_columns
-        if input_df[column].isna().any()
-    ]
-
-    if missing:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Missing values: {missing}"
-        )
-
-   
     for column, values in param_dict["scale_values"].items():
-        min_value = values["min"]
-        max_value = values["max"]
-
+        min_value, max_value = values["min"], values["max"]
         if max_value != min_value:
-            input_df[column] = (
-                (input_df[column] - min_value) /
-                (max_value - min_value)
-            ) * 4 + 1
+            df[column] = ((df[column] - min_value) / (max_value - min_value)) * 4 + 1
 
-  
-    X_input = input_df[columns.X_columns]
+    return df[columns.X_columns].astype(float)
 
-    X_input = input_df[columns.X_columns]
 
-    print("Дані перед predict:")
-    print(X_input.to_string())
+# ---------- режим 1: відкладені 10% ----------
+async def predict_holdout(session: AsyncSession):
+    model, param_dict = load_artifacts()
 
-    prediction = model.predict(X_input)
-
-   
-    prediction = model.predict(X_input)
-
-    print("Вхідні дані:")
-    print(X_input)
-
-    print("Прогноз:")
-    print(prediction)
-
-    print("Класи, які знає модель:")
-    print(model.classes_)
-    
-    session.add(
-        Prediction(
-            prediction=int(prediction[0]),
-            source="inference"
-        )
+    result = await session.execute(
+        select(StressLevelDatasetClean).order_by(StressLevelDatasetClean.ID)
     )
+    records = result.scalars().all()
 
-    print("Дані після обробки:")
-    print(X_input if "X_input" in locals() else input_df[columns.X_columns].to_string())
+    df = pd.DataFrame([
+        {c.name: getattr(r, c.name) for c in StressLevelDatasetClean.__table__.columns}
+        for r in records
+    ])
+    df = df.dropna(subset=["stress_level"])
 
-    
-    session.add(
-        InferenceInput(
-            input_data=input_data
+    # той самий split, що в /train-model
+    _, holdout = train_test_split(df, train_size=0.9, random_state=42)
+    raw = holdout.copy()                      # сирі значення для БД
+
+    y_pred = model.predict(preprocess(holdout, param_dict))
+
+    # прибираємо старі inference-рядки в обох таблицях, щоб не було дублів
+    await session.execute(delete(Prediction).where(Prediction.source == "inference"))
+    await session.execute(delete(InferenceInput).where(InferenceInput.source == "inference"))
+
+    inputs, predictions = [], []
+    for (_, row), p in zip(raw.iterrows(), y_pred):
+        ts = row["timestamp"] if pd.notna(row["timestamp"]) else datetime.utcnow()
+        features = {
+            c: (None if pd.isna(row[c]) else int(row[c]))
+            for c in columns.X_columns
+        }
+        inputs.append(InferenceInput(input_data=features, source="inference", timestamp=ts))
+        predictions.append(
+            Prediction(
+                prediction=int(p),
+                ground_truth=int(row["stress_level"]),
+                source="inference",
+                timestamp=ts,
+            )
         )
-    )
 
+    # спочатку входи, потім прогнози, в одному порядку -> id збігаються
+    session.add_all(inputs)
+    await session.flush()
+    session.add_all(predictions)
     await session.commit()
 
-    
+    accuracy = float((y_pred == raw["stress_level"].values).mean())
+    return {
+        "message": "Holdout predictions saved.",
+        "records": len(inputs),
+        "accuracy_on_holdout": round(accuracy, 3),
+    }
+
+
+# ---------- режим 2: один запит із JSON ----------
+async def predict_json(request: PredictRequest, session: AsyncSession):
+    model, param_dict = load_artifacts()
+
+    input_data = request.dict()
+    X_input = preprocess(pd.DataFrame([input_data]), param_dict)
+
+    missing = [c for c in columns.X_columns if X_input[c].isna().any()]
+    if missing:
+        raise HTTPException(status_code=422, detail=f"Missing values: {missing}")
+
+    prediction = int(model.predict(X_input)[0])
+
+    now = datetime.utcnow()
+
+    pred_row = Prediction(
+        prediction=prediction,
+        ground_truth=None,               # мітка поки невідома
+        source="inference",
+        timestamp=now,
+    )
+
+    session.add(InferenceInput(input_data=input_data, source="inference", timestamp=now))
+    session.add(pred_row)
+    await session.flush()                # з'являється pred_row.id
+    new_id = pred_row.id
+    await session.commit()
+
     return {
         "message": "Prediction completed successfully.",
+        "id": new_id,
         "input_data": input_data,
-        "predicted_stress_level": int(prediction[0])
+        "predicted_stress_level": prediction,
     }
+
+
+# ---------- єдиний ендпоінт ----------
+@router.post("/predict")
+async def predict(
+    request: Optional[PredictRequest] = None,
+    session: AsyncSession = Depends(get_session),
+):
+    if MODE == "holdout":
+        return await predict_holdout(session)
+
+    if MODE == "json":
+        return await predict_json(request or PredictRequest(), session)
+
+    raise HTTPException(status_code=500, detail='MODE має бути "holdout" або "json"')
+
+
+
+class GroundTruthRequest(BaseModel):
+    id: int
+    ground_truth: int = Field(ge=0, le=2)    # клас стресу: 0, 1 або 2
+
+
+# @router.post("/ground-truth")
+# async def set_ground_truth(
+#     request: GroundTruthRequest,
+#     session: AsyncSession = Depends(get_session),
+# ):
+#     result = await session.execute(
+#         select(Prediction).where(
+#             Prediction.id == request.id,
+#             Prediction.source == "inference",
+#         )
+#     )
+#     pred = result.scalar_one_or_none()
+
+#     if pred is None:
+#         raise HTTPException(status_code=404, detail="Запис з таким id не знайдено")
+
+#     pred.ground_truth = request.ground_truth
+#     await session.commit()
+
+#     return {"message": "Ground truth saved.", "id": request.id}

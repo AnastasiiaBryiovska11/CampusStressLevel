@@ -11,6 +11,7 @@ class Prediction(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     prediction = Column(Integer)
+    ground_truth = Column(Integer, nullable=True)
     timestamp = Column(DateTime, default=datetime.utcnow)
     source = Column(String)
 
@@ -21,6 +22,7 @@ class InferenceInput(Base):
     id = Column(Integer, primary_key=True, index=True)
     input_data = Column(JSON)
     timestamp = Column(DateTime, default=datetime.utcnow)
+    source = Column(String(50), nullable=True)
 
 
 class StressLevelDatasetClean(Base):
