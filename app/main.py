@@ -3,12 +3,13 @@ import uvicorn
 
 from app.endpoints.training import router as training_router
 from app.endpoints.inference import router as inference_router
-
+from app.endpoints.dataDrift import router as monitoring_router
 
 app = FastAPI()
 
 app.include_router(training_router)
 app.include_router(inference_router)
+app.include_router(monitoring_router)
 
 
 if __name__ == "__main__":
